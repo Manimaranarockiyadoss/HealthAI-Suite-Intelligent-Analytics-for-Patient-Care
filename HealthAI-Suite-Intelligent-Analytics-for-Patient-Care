@@ -1,0 +1,253 @@
+"""
+HealthAI Suite — Intelligent Analytics for Patient Care
+FINAL SINGLE FILE (Jupyter + API + Streamlit SAFE)
+
+USAGE:
+1) Jupyter / Python:
+   Run all cells or python healthai_suite.py
+
+2) FastAPI:
+   uvicorn healthai_suite:api_app --reload
+
+3) Streamlit:
+   streamlit run healthai_suite.py
+"""
+
+# ==========================================================
+# IMPORTS
+# ==========================================================
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score
+)
+
+import joblib
+
+# ==========================================================
+# CONFIG (JUPYTER + PY SAFE)
+# ==========================================================
+try:
+    BASE_DIR = Path(__file__).resolve().parent
+except NameError:
+    BASE_DIR = Path.cwd()
+
+MODELS_DIR = BASE_DIR / "models_single"
+MODELS_DIR.mkdir(exist_ok=True)
+
+RISK_MODEL_PATH = MODELS_DIR / "risk_model.pkl"
+LOS_MODEL_PATH = MODELS_DIR / "los_model.pkl"
+
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+
+TARGET_RISK = "readmission_risk"
+TARGET_LOS = "length_of_stay"
+ID_COL = "patient_id"
+
+# ==========================================================
+# SYNTHETIC HEALTHCARE DATA
+# ==========================================================
+def create_synthetic_ehr(n=2000):
+    rng = np.random.RandomState(RANDOM_STATE)
+
+    df = pd.DataFrame({
+        ID_COL: np.arange(n),
+        "age": rng.randint(18, 90, n),
+        "gender": rng.choice(["M", "F"], n),
+        "bmi": rng.normal(27, 5, n),
+        "systolic_bp": rng.normal(120, 15, n),
+        "diastolic_bp": rng.normal(80, 10, n),
+        "cholesterol": rng.normal(190, 30, n),
+        "diabetes_history": rng.choice([0, 1], n),
+        "smoker": rng.choice([0, 1], n),
+    })
+
+    # Classification target (risk)
+    logit = (
+        0.03 * df["age"]
+        + 0.08 * df["bmi"]
+        + 0.04 * df["systolic_bp"]
+        + 0.7 * df["diabetes_history"]
+        + 0.6 * df["smoker"]
+        - 15
+    )
+    df[TARGET_RISK] = (1 / (1 + np.exp(-logit)) > 0.5).astype(int)
+
+    # Regression target (LOS)
+    los = 3 + 0.05 * (df["age"] - 50) + 0.1 * (df["bmi"] - 25)
+    df[TARGET_LOS] = np.maximum(1, los + rng.normal(0, 2, n))
+
+    return df
+
+# ==========================================================
+# PREPROCESSOR
+# ==========================================================
+def build_preprocessor(X):
+    num_cols = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
+
+    if ID_COL in num_cols:
+        num_cols.remove(ID_COL)
+
+    return ColumnTransformer([
+        ("num", StandardScaler(), num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
+    ])
+
+# ==========================================================
+# TRAIN MODELS (100% SAFE)
+# ==========================================================
+def train_models_if_needed():
+    if RISK_MODEL_PATH.exists() and LOS_MODEL_PATH.exists():
+        print("✔ Models already trained.")
+        return
+
+    print("🔁 Training HealthAI models...")
+    df = create_synthetic_ehr()
+
+    X = df.drop(columns=[TARGET_RISK, TARGET_LOS])
+    y_risk = df[TARGET_RISK]
+    y_los = df[TARGET_LOS]
+
+    X_train, X_test, y_risk_train, y_risk_test, y_los_train, y_los_test = train_test_split(
+        X, y_risk, y_los,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y_risk
+    )
+
+    preprocessor = build_preprocessor(X_train)
+
+    clf = Pipeline([
+        ("prep", preprocessor),
+        ("model", RandomForestClassifier(
+            n_estimators=200,
+            class_weight="balanced",
+            random_state=RANDOM_STATE))
+    ])
+
+    reg = Pipeline([
+        ("prep", preprocessor),
+        ("model", RandomForestRegressor(
+            n_estimators=200,
+            random_state=RANDOM_STATE))
+    ])
+
+    clf.fit(X_train, y_risk_train)
+    reg.fit(X_train, y_los_train)
+
+    # ---- SAFE METRICS (NO ROC-AUC) ----
+    y_pred = clf.predict(X_test)
+    print(
+        f"📊 Classification → "
+        f"Accuracy={accuracy_score(y_risk_test, y_pred):.3f}, "
+        f"F1={f1_score(y_risk_test, y_pred, zero_division=0):.3f}"
+    )
+
+    y_los_pred = reg.predict(X_test)
+    print(
+        f"📊 Regression → "
+        f"MAE={mean_absolute_error(y_los_test, y_los_pred):.3f}, "
+        f"RMSE={mean_squared_error(y_los_test, y_los_pred, squared=False):.3f}, "
+        f"R2={r2_score(y_los_test, y_los_pred):.3f}"
+    )
+
+    joblib.dump(clf, RISK_MODEL_PATH)
+    joblib.dump(reg, LOS_MODEL_PATH)
+    print("✔ Models saved successfully.")
+
+train_models_if_needed()
+
+# ==========================================================
+# FASTAPI BACKEND
+# ==========================================================
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+risk_model = joblib.load(RISK_MODEL_PATH)
+los_model = joblib.load(LOS_MODEL_PATH)
+
+api_app = FastAPI(title="HealthAI Suite API")
+
+class PatientFeatures(BaseModel):
+    age: int = Field(..., ge=0, le=120)
+    gender: str
+    bmi: float
+    systolic_bp: float
+    diastolic_bp: float
+    cholesterol: float
+    diabetes_history: int = Field(..., ge=0, le=1)
+    smoker: int = Field(..., ge=0, le=1)
+
+@api_app.post("/predict_risk")
+def predict_risk(data: PatientFeatures):
+    df = pd.DataFrame([data.dict()])
+    proba = risk_model.predict_proba(df)
+
+    risk_prob = proba[0][1] if proba.shape[1] == 2 else 0.0
+    return {
+        "risk_probability": float(risk_prob),
+        "risk_label": int(risk_prob >= 0.5)
+    }
+
+@api_app.post("/predict_los")
+def predict_los(data: PatientFeatures):
+    df = pd.DataFrame([data.dict()])
+    los = los_model.predict(df)[0]
+    return {"predicted_los_days": float(los)}
+
+# ==========================================================
+# STREAMLIT DASHBOARD
+# ==========================================================
+def run_streamlit_dashboard():
+    import streamlit as st
+    import requests
+
+    API_URL = os.getenv("API_URL", "http://localhost:8000")
+
+    st.set_page_config(page_title="HealthAI Suite", layout="centered")
+    st.title("🏥 HealthAI Suite — Patient Analytics Dashboard")
+
+    st.sidebar.header("Patient Information")
+
+    payload = {
+        "age": st.sidebar.slider("Age", 18, 90, 45),
+        "gender": st.sidebar.selectbox("Gender", ["M", "F"]),
+        "bmi": st.sidebar.slider("BMI", 15.0, 45.0, 27.0),
+        "systolic_bp": st.sidebar.slider("Systolic BP", 80, 200, 120),
+        "diastolic_bp": st.sidebar.slider("Diastolic BP", 40, 120, 80),
+        "cholesterol": st.sidebar.slider("Cholesterol", 100, 300, 190),
+        "diabetes_history": st.sidebar.selectbox("Diabetes History", [0, 1]),
+        "smoker": st.sidebar.selectbox("Smoker", [0, 1]),
+    }
+
+    if st.button("Predict"):
+        risk = requests.post(f"{API_URL}/predict_risk", json=payload).json()
+        los = requests.post(f"{API_URL}/predict_los", json=payload).json()
+
+        st.subheader("🧠 Disease Risk Prediction")
+        st.metric("Risk Probability", f"{risk['risk_probability']:.2f}")
+
+        st.subheader("🏥 Length of Stay Prediction")
+        st.metric("Predicted LOS (days)", f"{los['predicted_los_days']:.1f}")
+
+# ==========================================================
+# ENTRY POINT
+# ==========================================================
+if __name__ == "__main__":
+    run_streamlit_dashboard()
